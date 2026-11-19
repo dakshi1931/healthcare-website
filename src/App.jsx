@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { GoogleLogin } from '@react-oauth/google';
+import { supabase } from './supabase.js';
 import {
   Activity, ArrowDown, ArrowRight, ArrowUpRight, BadgeCheck, Bell, CalendarDays,
   Check, ChevronDown, Clock3, Heart, HeartPulse, LockKeyhole, LogOut, Mail,
@@ -24,10 +25,11 @@ const articles = [
 ];
 
 async function apiRequest(path, options = {}) {
-  const headers = { 'Content-Type': 'application/json', ...options.headers };
-  const token = localStorage.getItem('healthcare-token');
+  const { authToken, ...requestOptions } = options;
+  const headers = { 'Content-Type': 'application/json', ...requestOptions.headers };
+  const token = authToken || localStorage.getItem('healthcare-token');
   if (token) headers.Authorization = `Bearer ${token}`;
-  const response = await fetch(`${API}${path}`, { ...options, headers });
+  const response = await fetch(`${API}${path}`, { ...requestOptions, headers });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.message || 'Something went wrong. Please try again.');
   return data;
@@ -45,17 +47,42 @@ function App() {
   const [authMode, setAuthMode] = useState('login');
   const [user, setUser] = useState(null);
   const [dashboard, setDashboard] = useState(null);
-  const [loading, setLoading] = useState(Boolean(localStorage.getItem('healthcare-token')));
+  const [loading, setLoading] = useState(Boolean(localStorage.getItem('healthcare-token') || supabase));
   const resetToken = new URLSearchParams(window.location.search).get('reset') || '';
 
   useEffect(() => {
-    const token = localStorage.getItem('healthcare-token');
-    if (!token) return;
-    apiRequest('/dashboard').then((data) => {
-      setUser(data.user);
-      setDashboard(data);
-      setView('dashboard');
-    }).catch(() => localStorage.removeItem('healthcare-token')).finally(() => setLoading(false));
+    let active = true;
+    async function restoreSession() {
+      try {
+        if (new URLSearchParams(window.location.search).has('reset')) return;
+        if (supabase) {
+          const { data: sessionData, error } = await supabase.auth.getSession();
+          if (error) throw error;
+          if (sessionData.session) {
+            const result = await apiRequest('/auth/supabase', {
+              method: 'POST',
+              authToken: sessionData.session.access_token,
+            });
+            if (active) acceptSession(result);
+            return;
+          }
+        }
+        const token = localStorage.getItem('healthcare-token');
+        if (!token) return;
+        const data = await apiRequest('/dashboard');
+        if (active) {
+          setUser(data.user);
+          setDashboard(data);
+          setView('dashboard');
+        }
+      } catch {
+        localStorage.removeItem('healthcare-token');
+      } finally {
+        if (active) setLoading(false);
+      }
+    }
+    restoreSession();
+    return () => { active = false; };
   }, []);
 
   function openAuth(mode = 'login') {
@@ -71,6 +98,15 @@ function App() {
     setView('dashboard');
   }
 
+  async function acceptSupabaseSession(session) {
+    if (!session) throw new Error('Check your email to confirm your account, then sign in.');
+    const data = await apiRequest('/auth/supabase', {
+      method: 'POST',
+      authToken: session.access_token,
+    });
+    acceptSession(data);
+  }
+
   async function signInWithGoogle(credential) {
     try {
       const data = await apiRequest('/auth/google', { method: 'POST', body: JSON.stringify({ credential }) });
@@ -80,8 +116,17 @@ function App() {
     }
   }
 
-  function signOut() {
+  async function signInWithSupabaseGoogle() {
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: 'google',
+      options: { redirectTo: window.location.origin },
+    });
+    if (error) throw error;
+  }
+
+  async function signOut() {
     localStorage.removeItem('healthcare-token');
+    if (supabase) await supabase.auth.signOut();
     setUser(null);
     setDashboard(null);
     setView('home');
@@ -89,8 +134,8 @@ function App() {
 
   if (loading) return <div className="loading-screen"><span className="loading-mark"><HeartPulse size={22} /></span>Preparing your care space...</div>;
   if (view === 'dashboard' && user) return <Dashboard user={user} dashboard={dashboard} setUser={setUser} setDashboard={setDashboard} onSignOut={signOut} />;
-  if (view === 'auth') return <AuthPage mode={authMode} setMode={setAuthMode} onBack={() => setView('home')} onSession={acceptSession} onGoogle={signInWithGoogle} googleEnabled={Boolean(import.meta.env.VITE_GOOGLE_CLIENT_ID)} />;
-  if (view === 'reset') return <ResetPage token={resetToken} onBack={() => { window.history.replaceState({}, '', '/'); setView('auth'); setAuthMode('login'); }} />;
+  if (view === 'auth') return <AuthPage mode={authMode} setMode={setAuthMode} onBack={() => setView('home')} onSession={acceptSession} onGoogle={signInWithGoogle} onSupabaseSession={acceptSupabaseSession} onSupabaseGoogle={signInWithSupabaseGoogle} supabaseEnabled={Boolean(supabase)} googleEnabled={!supabase && Boolean(import.meta.env.VITE_GOOGLE_CLIENT_ID)} />;
+  if (view === 'reset') return <ResetPage token={resetToken} supabaseEnabled={Boolean(supabase)} onBack={() => { window.history.replaceState({}, '', '/'); setView('auth'); setAuthMode('login'); }} />;
   return <Home onAuth={openAuth} onBook={() => user ? setView('dashboard') : openAuth('register')} />;
 }
 
@@ -144,7 +189,7 @@ function Home({ onAuth, onBook }) {
   </div>;
 }
 
-function AuthPage({ mode, setMode, onBack, onSession, onGoogle, googleEnabled }) {
+function AuthPage({ mode, setMode, onBack, onSession, onGoogle, onSupabaseSession, onSupabaseGoogle, supabaseEnabled, googleEnabled }) {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState('');
@@ -155,8 +200,30 @@ function AuthPage({ mode, setMode, onBack, onSession, onGoogle, googleEnabled })
     const values = Object.fromEntries(new FormData(event.currentTarget).entries());
     try {
       if (mode === 'forgot') {
-        const result = await apiRequest('/auth/forgot-password', { method: 'POST', body: JSON.stringify({ email: values.email }) });
-        setNotice(result.message);
+        if (supabaseEnabled) {
+          const { error } = await supabase.auth.resetPasswordForEmail(values.email, {
+            redirectTo: `${window.location.origin}/?reset=1`,
+          });
+          if (error) throw error;
+          setNotice('If an account exists for that email, password reset instructions are on their way.');
+        } else {
+          const result = await apiRequest('/auth/forgot-password', { method: 'POST', body: JSON.stringify({ email: values.email }) });
+          setNotice(result.message);
+        }
+      } else if (supabaseEnabled) {
+        const result = mode === 'register'
+          ? await supabase.auth.signUp({
+            email: values.email,
+            password: values.password,
+            options: { data: { name: values.name }, emailRedirectTo: window.location.origin },
+          })
+          : await supabase.auth.signInWithPassword({ email: values.email, password: values.password });
+        if (result.error) throw result.error;
+        if (mode === 'register' && !result.data.session) {
+          setNotice('Check your email to confirm your account, then come back to sign in.');
+        } else {
+          await onSupabaseSession(result.data.session);
+        }
       } else {
         const data = await apiRequest(`/auth/${mode}`, { method: 'POST', body: JSON.stringify(values) });
         onSession(data);
@@ -171,8 +238,9 @@ function AuthPage({ mode, setMode, onBack, onSession, onGoogle, googleEnabled })
     <div className="auth-top"><Brand /><button className="text-button" onClick={onBack}><X size={17} /> Back to home</button></div>
     <div className="auth-layout"><div className="auth-art"><img src="https://images.unsplash.com/photo-1576091160550-2173dba999ef?w=1100&h=1200&fit=crop" alt="A doctor offering attentive care" /><div className="auth-art-copy"><span className="eyebrow">YOUR HEALTH, OUR PRIORITY</span><p>Care that listens.<br /><em>People who care.</em></p><span className="auth-art-caption"><span className="online-dot" /> A little more human, every day.</span></div></div>
       <section className="auth-form-panel"><div className="auth-form-inner"><span className="auth-overline">{mode === 'register' ? 'CREATE YOUR ACCOUNT' : mode === 'forgot' ? 'PASSWORD RECOVERY' : 'WELCOME BACK'}</span><h1>{title}</h1><p className="auth-subtitle">{mode === 'register' ? 'Join a care team that puts you first.' : mode === 'forgot' ? 'Enter the email linked to your account and we’ll send a reset link.' : 'Sign in to pick up where you left off.'}</p>
+        {mode !== 'forgot' && supabaseEnabled && <button className="google-oauth-button" type="button" onClick={async () => { setError(''); try { await onSupabaseGoogle(); } catch (requestError) { setError(requestError.message); } }}><span className="google-g">G</span>Continue with Google</button>}
         {mode !== 'forgot' && googleEnabled && <div className="google-button"><GoogleLogin onSuccess={({ credential }) => credential && onGoogle(credential)} onError={() => setError('Google sign-in could not be completed.')} text={mode === 'register' ? 'signup_with' : 'signin_with'} shape="rectangular" theme="outline" size="large" width="380" /></div>}
-        {mode !== 'forgot' && googleEnabled && <div className="form-divider"><span>or continue with email</span></div>}
+        {mode !== 'forgot' && (googleEnabled || supabaseEnabled) && <div className="form-divider"><span>or continue with email</span></div>}
         <form className="auth-form" onSubmit={submit}>
           {mode === 'register' && <label>Full name<div className="input-wrap"><UserRound size={17} /><input name="name" type="text" placeholder="Your name" autoComplete="name" required maxLength="80" /></div></label>}
           <label>Email address<div className="input-wrap"><Mail size={17} /><input name="email" type="email" placeholder="you@example.com" autoComplete="email" required /></div></label>
@@ -188,7 +256,7 @@ function AuthPage({ mode, setMode, onBack, onSession, onGoogle, googleEnabled })
   </main>;
 }
 
-function ResetPage({ token, onBack }) {
+function ResetPage({ token, supabaseEnabled, onBack }) {
   const [error, setError] = useState('');
   const [done, setDone] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -197,7 +265,13 @@ function ResetPage({ token, onBack }) {
     const values = Object.fromEntries(new FormData(event.currentTarget).entries());
     if (values.password !== values.confirmPassword) { setError('Those passwords do not match.'); setBusy(false); return; }
     try {
-      await apiRequest('/auth/reset-password', { method: 'POST', body: JSON.stringify({ token, password: values.password }) });
+      if (supabaseEnabled) {
+        const { error } = await supabase.auth.updateUser({ password: values.password });
+        if (error) throw error;
+        await supabase.auth.signOut();
+      } else {
+        await apiRequest('/auth/reset-password', { method: 'POST', body: JSON.stringify({ token, password: values.password }) });
+      }
       setDone(true);
     } catch (requestError) { setError(requestError.message); }
     finally { setBusy(false); }

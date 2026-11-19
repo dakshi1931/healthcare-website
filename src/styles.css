@@ -186,6 +186,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .auth-subtitle, .reset-panel > p { margin: 0 0 23px; color: #7b8f98; font-size: 12px; line-height: 1.65; }
 .google-button { min-height: 42px; display: flex; justify-content: center; align-items: center; }
 .google-button > div { width: 100%; }
+.google-oauth-button { width: 100%; min-height: 42px; display: flex; justify-content: center; align-items: center; gap: 10px; border: 1px solid #dfe9ed; border-radius: 3px; color: #496574; background: white; font-size: 11px; font-weight: 600; cursor: pointer; transition: background .2s, border-color .2s; }
+.google-oauth-button:hover { border-color: #b7d7e1; background: #f9fcfd; }
+.google-g { color: #4285f4; font-size: 15px; font-weight: 700; }
 .form-divider { display: flex; align-items: center; gap: 12px; margin: 19px 0; color: #9aaab0; font-size: 10px; }
 .form-divider::before, .form-divider::after { content: ''; flex: 1; height: 1px; background: #e8eef0; }
 .auth-form, .dashboard-form { display: grid; gap: 14px; }

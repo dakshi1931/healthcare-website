@@ -7,11 +7,18 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import nodemailer from 'nodemailer';
 import { OAuth2Client } from 'google-auth-library';
+import { createClient } from '@supabase/supabase-js';
 import rateLimit from 'express-rate-limit';
 
 const app = express();
 const port = process.env.PORT || 4000;
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+const supabasePublishableKey = process.env.SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_ANON_KEY;
+const supabaseAuth = process.env.SUPABASE_URL && supabasePublishableKey
+  ? createClient(process.env.SUPABASE_URL, supabasePublishableKey, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  })
+  : null;
 
 app.use(cors({ origin: process.env.CLIENT_URL || 'http://localhost:5173' }));
 app.use(express.json({ limit: '20kb' }));
@@ -26,6 +33,7 @@ const healthSchema = new mongoose.Schema({
 const userSchema = new mongoose.Schema({
   name: { type: String, required: true, trim: true, maxlength: 80 },
   email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+  supabaseId: { type: String, unique: true, sparse: true },
   passwordHash: { type: String, select: false },
   googleId: { type: String, sparse: true },
   phone: { type: String, default: '' },
@@ -85,6 +93,35 @@ async function authenticate(req, res, next) {
 
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected' });
+});
+
+app.post('/api/auth/supabase', authLimiter, ensureDatabase, async (req, res) => {
+  if (!supabaseAuth) return res.status(503).json({ message: 'Supabase authentication is not configured.' });
+  const accessToken = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+  if (!accessToken) return res.status(401).json({ message: 'A Supabase access token is required.' });
+
+  const { data, error } = await supabaseAuth.auth.getUser(accessToken);
+  const authUser = data?.user;
+  if (error || !authUser?.email) return res.status(401).json({ message: 'The Supabase session could not be verified.' });
+  if (!authUser.email_confirmed_at) return res.status(403).json({ message: 'Confirm your email address before continuing.' });
+
+  const email = authUser.email.trim().toLowerCase();
+  let user = await User.findOne({ supabaseId: authUser.id });
+  if (!user) {
+    user = await User.findOne({ email });
+    if (user?.supabaseId && user.supabaseId !== authUser.id) {
+      return res.status(409).json({ message: 'This email is already linked to another sign-in method.' });
+    }
+    if (!user) {
+      const name = String(authUser.user_metadata?.full_name || authUser.user_metadata?.name || email.split('@')[0]).trim().slice(0, 80);
+      user = await User.create({ name: name || 'HealthCare member', email, supabaseId: authUser.id });
+    } else {
+      user.supabaseId = authUser.id;
+      await user.save();
+    }
+  }
+
+  res.json({ token: createToken(user._id), user: safeUser(user) });
 });
 
 app.post('/api/auth/register', authLimiter, ensureDatabase, async (req, res) => {
